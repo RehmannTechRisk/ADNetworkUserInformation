@@ -177,21 +177,26 @@ function Get-AccurateLastLogon {
     }
 }
 
+# Helper: safely read a property only if it exists on the object
+function Get-PropValue {
+    param(
+        [Parameter(Mandatory)] $Object,
+        [Parameter(Mandatory)][string] $PropName
+    )
+    if (-not $Object) { return $null }
+    if ($Object.PSObject.Properties.Name -contains $PropName) {
+        return $Object.$PropName
+    }
+    return $null
+}
+
 try {
     Test-Module -Name ActiveDirectory
 
-    $adProps = @(
-        'samAccountName','name','userAccountControl',
-        'comment','description','userComment',
-        'homeDrive','homeDirectory','profilePath','scriptPath','logonWorkstations',
-        'CannotChangePassword','PasswordLastSet','PasswordNotRequired','PasswordNeverExpires',
-        'Enabled','LockedOut','AccountExpirationDate','LastLogonDate',
-        'msDS-UserPasswordExpiryTimeComputed','logonHours'
-    )
-
+    # Use -Properties * to request all properties; script will pick what exists per-object
     $getParams = @{
         Filter     = '*'
-        Properties = $adProps
+        Properties = '*'
         ErrorAction= 'Stop'
     }
     if ($SearchBase) { $getParams['SearchBase'] = $SearchBase }
@@ -207,22 +212,37 @@ try {
     }
 
     $out = foreach ($u in $users) {
-        # AccountType
-        $acctType = Get-AccountTypeFromUAC -UAC ([int]$u.userAccountControl)
+        # Safe reads
+        $uacRaw = Get-PropValue -Object $u -PropName 'userAccountControl'
+        $uac = if ($uacRaw) { [int]$uacRaw } else { 0 }
 
-        # Comment (prefer 'comment', fallback to 'description', then 'userComment')
-        $comment = if ($u.comment) { $u.comment }
-                   elseif ($u.description) { $u.description }
-                   else { $u.userComment }
+        # AccountType
+        $acctType = Get-AccountTypeFromUAC -UAC $uac
+
+        # Comment (prefer 'comment', fallback to 'description', then 'userComment' if present)
+        $comment = $null
+        $c = Get-PropValue -Object $u -PropName 'comment'
+        if ($c) {
+            $comment = $c
+        } else {
+            $d = Get-PropValue -Object $u -PropName 'description'
+            if ($d) {
+                $comment = $d
+            } else {
+                $uc = Get-PropValue -Object $u -PropName 'userComment'
+                if ($uc) { $comment = $uc }
+            }
+        }
 
         # Password expiry time (constructed attribute)
         $pwdExpTime = $null
-        if ($u.'msDS-UserPasswordExpiryTimeComputed') {
-            try { $pwdExpTime = [DateTime]::FromFileTime([int64]$u.'msDS-UserPasswordExpiryTimeComputed') } catch {}
+        $pwdRaw = Get-PropValue -Object $u -PropName 'msDS-UserPasswordExpiryTimeComputed'
+        if ($pwdRaw) {
+            try { $pwdExpTime = [DateTime]::FromFileTime([int64]$pwdRaw) } catch {}
         }
 
         # Accurate last logon (optional)
-        $lastLogonTime   = $u.LastLogonDate
+        $lastLogonTime   = Get-PropValue -Object $u -PropName 'LastLogonDate'
         $lastLogonServer = $null
         if ($AccurateLastLogon -and $dcs) {
             $ll = Get-AccurateLastLogon -User $u -DomainControllers $dcs
@@ -231,30 +251,36 @@ try {
         }
 
         # LogonHours -> text
-        $logonHoursText = Convert-LogonHoursToText -Bytes $u.logonHours
+        $logonBytes = Get-PropValue -Object $u -PropName 'logonHours'
+        $logonHoursText = Convert-LogonHoursToText -Bytes $logonBytes
 
         [pscustomobject]@{
-            UserName          = $u.SamAccountName
-            FullName          = $u.Name
+            UserName          = Get-PropValue -Object $u -PropName 'SamAccountName'
+            FullName          = Get-PropValue -Object $u -PropName 'Name'
             AccountType       = $acctType
             Comment           = $comment
-            HomeDrive         = $u.homeDrive
-            HomeDir           = $u.homeDirectory
-            Profile           = $u.profilePath
-            LogonScript       = $u.scriptPath
-            Workstations      = $u.logonWorkstations
-            PswdCanBeChanged  = -not [bool]$u.CannotChangePassword
-            PswdLastSetTime   = $u.PasswordLastSet
-            PswdRequired      = -not [bool]$u.PasswordNotRequired
-            PswdExpires       = -not [bool]$u.PasswordNeverExpires
+            HomeDrive         = Get-PropValue -Object $u -PropName 'homeDrive'
+            HomeDir           = Get-PropValue -Object $u -PropName 'homeDirectory'
+            Profile           = Get-PropValue -Object $u -PropName 'profilePath'
+            LogonScript       = Get-PropValue -Object $u -PropName 'scriptPath'
+            Workstations      = Get-PropValue -Object $u -PropName 'logonWorkstations'
+            PswdCanBeChanged  = -not [bool](Get-PropValue -Object $u -PropName 'CannotChangePassword')
+            PswdLastSetTime   = Get-PropValue -Object $u -PropName 'PasswordLastSet'
+            PswdRequired      = -not [bool](Get-PropValue -Object $u -PropName 'PasswordNotRequired')
+            PswdExpires       = -not [bool](Get-PropValue -Object $u -PropName 'PasswordNeverExpires')
             PswdExpiresTime   = $pwdExpTime
-            AcctDisabled      = -not [bool]$u.Enabled
-            AcctLockedOut     = [bool]$u.LockedOut
-            AcctExpiresTime   = $u.AccountExpirationDate
+            AcctDisabled      = -not [bool](Get-PropValue -Object $u -PropName 'Enabled')
+            AcctLockedOut     = [bool](Get-PropValue -Object $u -PropName 'LockedOut')
+            AcctExpiresTime   = Get-PropValue -Object $u -PropName 'AccountExpirationDate'
             LastLogonTime     = $lastLogonTime
             LastLogonServer   = $lastLogonServer
             LogonHours        = $logonHoursText
         }
+    }
+
+    # Ensure we have an array so Count works predictably
+    if ($out -is [System.Collections.IEnumerable] -and -not ($out -is [array])) {
+        $out = ,$out
     }
 
     if (-not $NoExport) {
